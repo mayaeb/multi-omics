@@ -1,0 +1,154 @@
+---
+title: "scRNA_ATACseq_integration"
+author: "Maya Emmons-Bell"
+date: "4/25/2022"
+output: html_document
+---
+
+Integrating independent scRNAseq and scATACseq data sets using Signac 
+
+Analyzing scATACseq data of adult mouse brains (10X Genomics), and scRNAseq data of adult mouse brains
+(non-myeloid tissue, Tabula Muris).
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+load libraries 
+```{r libraries}
+library(Signac)
+library(tidyverse)
+library(Seurat)
+library(ggplot2)
+library(mebfunctions)
+library(EnsDb.Mmusculus.v79)
+library(SingleCellExperiment)
+library(ExperimentHub)
+library(scater)
+```
+
+
+load data
+```{r}
+#read in atacseq data, create Signac object
+
+#read in counts file 
+counts <- Read10X_h5("atac_v1_adult_brain_fresh_5k_filtered_peak_bc_matrix.h5")
+
+#read in metadata file 
+metadata <- read.csv(
+  file = "atac_v1_adult_brain_fresh_5k_singlecell.csv",
+  header = TRUE,
+  row.names = 1
+)
+ 
+#create chromatin assay
+chrom_assay <- CreateChromatinAssay(
+  counts = counts,
+  sep = c(":", "-"),
+  genome = "mm10",
+  fragments = 'atac_v1_adult_brain_fresh_5k_fragments.tsv.gz',
+  min.cells = 1
+)
+
+#create Seurat object
+scATAC_obj <- CreateSeuratObject(
+  counts = chrom_assay, 
+  assay = "peaks", 
+  project = 'ATAC', 
+  meta.data = metadata
+)
+
+#take a look at peaks data 
+scATAC_obj[['peaks']]
+#take a look at granges data to see regions associated with features in object
+granges(scATAC_obj)
+
+#read in scRNAseq data - brain sample from Tabula Muris
+load("facs_Brain_Non-Myeloid_seurat_tiss.Robj", verbose = TRUE)
+scRNAseq_obj <- tiss
+#the data is in the v2 Seurat format, updating the object
+scRNAseq_obj <- UpdateSeuratObject(scRNAseq_obj)
+DimPlot(scRNAseq_obj)
+
+```
+
+process each modality seperately 
+```{r}
+#RNA
+scRNAseq_obj <- NormalizeData(scRNAseq_obj)
+scRNAseq_obj <- FindVariableFeatures(scRNAseq_obj)
+scRNAseq_obj <- ScaleData(scRNAseq_obj)
+scRNAseq_obj <- RunPCA(scRNAseq_obj)
+scRNAseq_obj <- FindNeighbors(scRNAseq_obj)
+scRNAseq_obj <- FindClusters(scRNAseq_obj, verbose = FALSE, resolution = c(0.1, 0.3, 0.5, 0.8, 1))
+scRNAseq_obj <- RunUMAP(scRNAseq_obj, dims = 1:30)
+DimPlot(scRNAseq_obj, group.by = "RNA_snn_res.0.3")
+Idents(scRNAseq_obj) <- c("RNA_snn_res.0.3")
+
+
+#ATAC
+#annotate genes 
+annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Mmusculus.v79)
+seqlevelsStyle(annotations) <- "UCSC"
+genome(annotations) <- "mm10"
+Annotation(scATAC_obj) <- annotations
+
+scATAC_obj <- RunTFIDF(scATAC_obj)
+scATAC_obj <- FindTopFeatures(scATAC_obj, min.cutoff = "q0")
+scATAC_obj <- RunSVD(scATAC_obj)
+#first PCA dim is correlated with sequencing depth - not including in in UMAP embedding
+scATAC_obj <- RunUMAP(scATAC_obj, reduction = "lsi", dims = 2:30, reduction.name = "umap.atac", reduction.key = "atacUMAP_")
+
+#visualize 
+p1 <- DimPlot(scRNAseq_obj, label = TRUE) + NoLegend() + ggtitle("RNA")
+p2 <- DimPlot(scATAC_obj, group.by = "orig.ident", label = FALSE) + NoLegend() + ggtitle("ATAC")
+p1 + p2
+```
+
+Identify anchors between the two datasets 
+```{r}
+#Signac function GeneActivity() estimates ATAC reads in gene body + 2KB upstream of gene body 
+
+#Take variable features from scRNAseq data set, run GeneActivity() on these features 
+gene.activities <- GeneActivity(scATAC_obj, features = VariableFeatures(scRNAseq_obj))
+
+#create assay in scATACseq object, add gene activity score 
+scATAC_obj[["ACTIVITY"]] <- CreateAssayObject(counts = gene.activities)
+
+# normalize gene activities
+DefaultAssay(scATAC_obj) <- "ACTIVITY"
+scATAC_obj <- NormalizeData(scATAC_obj)
+scATAC_obj <- ScaleData(scATAC_obj, features = rownames(scATAC_obj))
+
+#Identify anchors for integration
+#this is computationally intensive - increasing memory
+options(future.globals.maxSize = 8000 * 1024^2)
+transfer.anchors <- FindTransferAnchors(reference = scRNAseq_obj, query = scATAC_obj, features = VariableFeatures(object = scRNAseq_obj), reference.assay = "RNA", query.assay = "ACTIVITY", reduction = "cca")
+
+```
+Transfer anchors to scATACseq dataset 
+```{r}
+#use cell types from scRNAseq data to predict annotations for scATACseq data
+celltype.predictions <- TransferData(anchorset = transfer.anchors, refdata = scRNAseq_obj$cell_ontology_class,
+    weight.reduction = scATAC_obj[["lsi"]], dims = 2:30)
+#add cell type predictions to ATACseq metadata
+scATAC_obj <- AddMetaData(scATAC_obj, metadata = celltype.predictions)
+
+#predicted cell types are stored in predicted.id field, take a look at a few 
+head(scATAC_obj$predicted.id)
+
+#in this case we don't have ground truth annotations because the data sets were collected in two experiments,
+#but if data was collected from a multiome kit, the following code could be run to check how accurate the prediction scores are:
+
+#pbmc.atac$annotation_correct <- pbmc.atac$predicted.id == pbmc.atac$seurat_annotations
+```
+Visualize annotations
+```{r}
+#some cell types are missing in ATACseq data, because I am using a non-myeloid scRNAseq reference dataset
+p1 <- DimPlot(scATAC_obj, group.by = "predicted.id", label = TRUE)  + ggtitle("scATACseq - predicted annotation")
+p2 <- DimPlot(scRNAseq_obj, group.by = "cell_ontology_class", label = TRUE)  + ggtitle("scRNAseq - ground-truth annotation")
+p1 | p2
+```
+
